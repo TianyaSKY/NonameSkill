@@ -1,0 +1,4 @@
+interface:
+  display_name: "无名杀扩展开发"
+  short_description: "基于本仓库教程构建和调试无名杀扩展。"
+  default_prompt: "使用此技能基于本地教程文档实现无名杀扩展中的角色、技能、卡牌、AI 与联机适配能力。"

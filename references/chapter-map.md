@@ -9,7 +9,7 @@
 - `tutorial/structure.md`：扩展目录结构与 async/step 写法。  
 - `tutorial/code-standard.md`：命名、格式、结构规范。  
 - `tutorial/appendix/api.md`：玩家/卡牌/事件/游戏/UI 等 API 索引。
-- `../assets/dataset.jsonl`：技能描述到实现代码的数据集（4398 条）。
+- `../assets/dataset.sqlite3`：技能描述到实现代码的数据集索引（SQLite）。
 
 ## 按任务选文档
 
@@ -68,14 +68,12 @@
 - 数据集检索脚本：  
 `../scripts/search_dataset.py`
 
-- 数据集校验脚本：  
-`../scripts/validate_dataset.py`
-
 - 关键词清单：  
 `search-keywords.md`
 
 - 常用命令：  
-`python ../scripts/validate_dataset.py`  
 `python ../scripts/search_dataset.py --query "锁定技 体力变化"`  
 `python ../scripts/search_dataset.py --query "受伤后 摸牌 damageEnd draw" --top-k 8 --no-multi-route`  
+`python ../scripts/search_dataset.py --query "受伤后 摸牌 damageEnd draw" --top-k 8 --no-multi-route --min-overlap 3 --min-score 10`  
+`python ../scripts/search_dataset.py --query "做一个收到伤害摸牌的技能" --top-k 8 --show-routes --candidate-pool 800 --min-score 12`  
 `python ../scripts/search_dataset.py --query "主公技 群势力 杀" --top-k 8 --full-output`  

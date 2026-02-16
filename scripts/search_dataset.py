@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import dataclasses
 import json
+import math
 import os
 import re
+import sqlite3
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -13,6 +17,8 @@ from typing import Any
 
 WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 TOKEN_SPLIT_RE = re.compile(r"[\s,，。！？、;；:：()（）\[\]{}<>《》\"'`]+")
+CJK_BLOCK_RE = re.compile(r"[\u4e00-\u9fff]+")
+CJK_SINGLE_RE = re.compile(r"^[\u4e00-\u9fff]$")
 
 REWRITE_RULES: list[tuple[str, list[str]]] = [
     ("受到伤害", ["受伤后", "伤害后", "damageAfter", "damageEnd", "damage"]),
@@ -30,7 +36,7 @@ REWRITE_RULES: list[tuple[str, list[str]]] = [
 ]
 
 TRIGGER_HINTS: dict[str, list[str]] = {
-    "damage": ["受到伤害", "收到伤害", "受伤", "伤害后", "damageAfter", "damageEnd", "damage"],
+    "damage": ["受到伤害", "收到伤害", "受伤", "伤害", "伤害后", "damageAfter", "damageEnd", "damage"],
     "hp_change": ["体力变化", "changeHp", "changeHpAfter"],
     "lose_hp": ["失去体力", "loseHp", "loseHpAfter"],
     "use_card": ["使用牌", "useCard", "useCard1", "useCard2"],
@@ -43,6 +49,11 @@ EFFECT_HINTS: dict[str, list[str]] = {
     "damage": ["造成伤害", "damage", "damageBegin", "damageEnd"],
     "gain_card": ["获得牌", "gain", "gainPlayerCard"],
 }
+
+_SIMPLE_NORM = lambda s: re.sub(r"\s+", " ", s).strip().lower()
+DAMAGE_HINT_TOKENS = {_SIMPLE_NORM(t) for t in TRIGGER_HINTS["damage"]}
+DRAW_HINT_TOKENS = {_SIMPLE_NORM(t) for t in EFFECT_HINTS["draw"]}
+DAMAGE_TO_DRAW_RE = re.compile(r"(受到伤害后|收到伤害后|受伤后|伤害后)[^。；;]{0,28}(摸|draw)")
 
 STOP_PHRASES = [
     "请帮我",
@@ -59,30 +70,96 @@ STOP_PHRASES = [
     "的技能",
 ]
 
+LOW_SIGNAL_TOKENS = {
+    "技能",
+    "实现",
+    "做一个",
+    "做个",
+    "写一个",
+    "写个",
+    "一个",
+    "trigger",
+    "filter",
+    "content",
+}
 
-def default_dataset_path() -> Path:
-    # scripts/search_dataset.py -> skill_root/assets/dataset.jsonl
-    return Path(__file__).resolve().parents[1] / "assets" / "dataset.jsonl"
+
+def default_sqlite_path() -> Path:
+    # scripts/search_dataset.py -> skill_root/assets/dataset.sqlite3
+    return Path(__file__).resolve().parents[1] / "assets" / "dataset.sqlite3"
+
+
+def default_card_sqlite_path() -> Path:
+    # scripts/search_dataset.py -> skill_root/assets/card_code_effect_dataset.sqlite3
+    return Path(__file__).resolve().parents[1] / "assets" / "card_code_effect_dataset.sqlite3"
+
+
+@dataclasses.dataclass
+class RowFeatures:
+    row: dict[str, Any]
+    instruction_norm: str
+    input_norm: str
+    output_norm: str
+    instruction_tokens: set[str]
+    input_tokens: set[str]
+    output_tokens: set[str]
+    all_tokens: set[str]
 
 
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def tokenize(text: str) -> set[str]:
+def extract_index_terms(text: str) -> set[str]:
+    text_norm = normalize(text)
+    terms: set[str] = set()
+
+    for token in TOKEN_SPLIT_RE.split(text_norm):
+        if (2 <= len(token) <= 48 or (len(token) == 1 and CJK_SINGLE_RE.fullmatch(token))) and token not in LOW_SIGNAL_TOKENS:
+            terms.add(token)
+
+    for token in WORD_RE.findall(text_norm):
+        if 2 <= len(token) <= 48 and token not in LOW_SIGNAL_TOKENS:
+            terms.add(token)
+
+    # Add CJK n-grams so phrase queries like "受到伤害后 摸牌" can be matched efficiently in FTS.
+    for block in CJK_BLOCK_RE.findall(text_norm):
+        block_len = len(block)
+        if 2 <= block_len <= 24:
+            terms.add(block)
+        for n in (2, 3, 4):
+            if block_len < n:
+                continue
+            for i in range(block_len - n + 1):
+                terms.add(block[i : i + n])
+
+    return terms
+
+
+def tokenize(text: str, *, expand_hints: bool = False) -> set[str]:
     text = normalize(text)
-    parts = {p for p in TOKEN_SPLIT_RE.split(text) if len(p) >= 2}
+    parts = {
+        p
+        for p in TOKEN_SPLIT_RE.split(text)
+        if (len(p) >= 2 or (len(p) == 1 and CJK_SINGLE_RE.fullmatch(p)))
+    }
     words = {w for w in WORD_RE.findall(text) if len(w) >= 2}
+
+    if not expand_hints:
+        return parts | words
 
     hinted: set[str] = set()
     for source, alts in REWRITE_RULES:
         if source in text:
             hinted.add(source)
-        for alt in alts:
-            if alt in text and len(alt) >= 2:
-                hinted.add(alt)
+            hinted.update(alt for alt in alts if len(alt) >= 2)
 
     return parts | words | hinted
+
+
+def filter_query_tokens(tokens: set[str]) -> set[str]:
+    filtered = {t for t in tokens if t not in LOW_SIGNAL_TOKENS}
+    return filtered or tokens
 
 
 def snippet(text: str, limit: int) -> str:
@@ -92,15 +169,30 @@ def snippet(text: str, limit: int) -> str:
     return compact[: limit - 3] + "..."
 
 
+def normalize_route_text(route: str) -> str:
+    route = re.sub(r"(后){2,}", "后", route)
+    route = re.sub(r"\s+", " ", route).strip()
+    return route
+
+
+def safe_replace_route(query: str, source: str, alt: str) -> str:
+    pattern = re.escape(source)
+    # Avoid artifacts like "伤害后后" and "damageAfter后".
+    if not source.endswith("后") and (alt.endswith("后") or WORD_RE.fullmatch(alt)):
+        pattern = re.escape(source) + r"(?!后)"
+    return normalize_route_text(re.sub(pattern, alt, query))
+
+
 def unique_preserve(items: list[str], max_count: int) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for item in items:
+        item = normalize_route_text(item)
         value = normalize(item)
         if not value or value in seen:
             continue
         seen.add(value)
-        out.append(item.strip())
+        out.append(item)
         if len(out) >= max_count:
             break
     return out
@@ -108,6 +200,14 @@ def unique_preserve(items: list[str], max_count: int) -> list[str]:
 
 def contains_any(text: str, values: list[str]) -> bool:
     return any(v in text for v in values)
+
+
+def collect_required_tokens(text_norm: str, groups: dict[str, list[str]]) -> set[str]:
+    required: set[str] = set()
+    for hints in groups.values():
+        if any(normalize(h) in text_norm for h in hints):
+            required.update(normalize(h) for h in hints if len(normalize(h)) >= 2)
+    return required
 
 
 def simplify_query(query: str) -> str:
@@ -129,7 +229,7 @@ def expand_query_routes(query: str, max_routes: int) -> list[str]:
     for source, alts in REWRITE_RULES:
         if source in query:
             for alt in alts:
-                routes.append(query.replace(source, alt))
+                routes.append(safe_replace_route(query, source, alt))
                 if simplified:
                     routes.append(f"{simplified} {alt}")
 
@@ -288,52 +388,207 @@ def build_routes(
     raise SystemExit(f"Unknown rewrite mode: {rewrite_mode}")
 
 
-def score_row(query_norm: str, query_tokens: set[str], row: dict[str, Any]) -> float:
-    instruction = str(row.get("instruction", ""))
-    model_input = str(row.get("input", ""))
-    output = str(row.get("output", ""))
+def min_required_overlap(query_tokens: set[str], manual_min_overlap: int) -> int:
+    if manual_min_overlap > 0:
+        return manual_min_overlap
+    n = len(query_tokens)
+    if n <= 1:
+        return 1
+    if n <= 4:
+        return 2
+    return max(2, math.ceil(n * 0.45))
 
-    searchable = normalize(f"{instruction}\n{model_input}")
+
+def build_feature_index(rows: list[dict[str, Any]]) -> tuple[list[RowFeatures], dict[str, float]]:
+    features: list[RowFeatures] = []
+    df: collections.Counter[str] = collections.Counter()
+    for row in rows:
+        instruction_norm = normalize(str(row.get("instruction", "")))
+        input_norm = normalize(str(row.get("input", "")))
+        output_norm = normalize(str(row.get("output", "")))
+        instruction_tokens = tokenize(instruction_norm, expand_hints=False)
+        input_tokens = tokenize(input_norm, expand_hints=False)
+        output_tokens = tokenize(output_norm, expand_hints=False)
+        all_tokens = instruction_tokens | input_tokens | output_tokens
+        features.append(
+            RowFeatures(
+                row=row,
+                instruction_norm=instruction_norm,
+                input_norm=input_norm,
+                output_norm=output_norm,
+                instruction_tokens=instruction_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                all_tokens=all_tokens,
+            )
+        )
+        for token in all_tokens:
+            df[token] += 1
+
+    n_docs = max(1, len(features))
+    idf: dict[str, float] = {}
+    for token, freq in df.items():
+        # BM25-like IDF, but simplified for this script.
+        idf[token] = math.log((n_docs + 1) / (freq + 0.5)) + 1.0
+    return features, idf
+
+
+def weighted_overlap(query_tokens: set[str], field_tokens: set[str], token_idf: dict[str, float]) -> float:
+    return sum(token_idf.get(token, 1.0) for token in query_tokens if token in field_tokens)
+
+
+def score_row(
+    query_norm: str,
+    query_tokens: set[str],
+    rowf: RowFeatures,
+    token_idf: dict[str, float],
+    min_overlap: int,
+    required_trigger_tokens: set[str],
+    required_effect_tokens: set[str],
+) -> float:
+    row_text = f"{rowf.instruction_norm} {rowf.input_norm} {rowf.output_norm}"
+    if required_trigger_tokens and not any(t in row_text for t in required_trigger_tokens):
+        return 0.0
+    if required_effect_tokens and not any(t in row_text for t in required_effect_tokens):
+        return 0.0
+
+    overlap_tokens = query_tokens & rowf.all_tokens
+    has_exact_match = bool(
+        query_norm
+        and (
+            query_norm in rowf.instruction_norm
+            or query_norm in rowf.input_norm
+            or query_norm in rowf.output_norm
+        )
+    )
+    if not has_exact_match and len(overlap_tokens) < min_overlap:
+        return 0.0
+
     score = 0.0
+    if query_norm:
+        if query_norm in rowf.instruction_norm:
+            score += 14.0
+        elif query_norm in rowf.input_norm:
+            score += 6.0
+        elif query_norm in rowf.output_norm:
+            score += 2.0
 
-    if query_norm and query_norm in searchable:
-        score += 10.0
+    score += 2.8 * weighted_overlap(query_tokens, rowf.instruction_tokens, token_idf)
+    score += 1.2 * weighted_overlap(query_tokens, rowf.input_tokens, token_idf)
+    score += 0.45 * weighted_overlap(query_tokens, rowf.output_tokens, token_idf)
 
-    row_tokens = tokenize(searchable)
-    score += 1.6 * len(query_tokens & row_tokens)
+    has_damage_intent = bool(required_trigger_tokens & DAMAGE_HINT_TOKENS)
+    has_draw_intent = bool(required_effect_tokens & DRAW_HINT_TOKENS)
+    if has_damage_intent and has_draw_intent:
+        if DAMAGE_TO_DRAW_RE.search(rowf.instruction_norm):
+            score += 12.0
+        elif (
+            ("受到伤害后" in rowf.instruction_norm or "收到伤害后" in rowf.instruction_norm or "受伤后" in rowf.instruction_norm)
+            and ("摸牌" in rowf.instruction_norm or "摸一张牌" in rowf.instruction_norm)
+        ):
+            score += 6.0
 
-    output_norm = normalize(output)
-    output_overlap = len(query_tokens & tokenize(output_norm))
-    score += 0.35 * output_overlap
+    if len(overlap_tokens) >= (min_overlap + 2):
+        score += 1.5
 
     return score
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
+def sql_escape_fts_token(token: str) -> str:
+    return token.replace('"', '""')
+
+
+def make_fts_query_from_route(route: str) -> str:
+    terms = sorted(extract_index_terms(route))
+    if not terms:
+        return ""
+    # OR for recall; rerank happens in Python scoring.
+    return " OR ".join(f'"{sql_escape_fts_token(term)}"' for term in terms[:40])
+
+
+def load_candidates_from_sqlite(
+    sqlite_path: Path,
+    routes: list[str],
+    candidate_pool: int,
+) -> list[dict[str, Any]]:
+    per_route = max(80, candidate_pool // max(len(routes), 1))
+    rows_by_line: dict[int, dict[str, Any]] = {}
+
+    with sqlite3.connect(str(sqlite_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        for route in routes:
+            match_query = make_fts_query_from_route(route)
+            if not match_query:
                 continue
             try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict):
-                row["_line"] = i
-                rows.append(row)
-    return rows
+                cur.execute(
+                    """
+                    SELECT s.line, s.instruction, s.input, s.output
+                    FROM skills_fts
+                    JOIN skills s ON s.id = skills_fts.rowid
+                    WHERE skills_fts MATCH ?
+                    ORDER BY bm25(skills_fts)
+                    LIMIT ?
+                    """,
+                    (match_query, per_route),
+                )
+                fetched = cur.fetchall()
+            except sqlite3.Error:
+                fetched = []
+
+            for item in fetched:
+                line = int(item["line"])
+                if line in rows_by_line:
+                    continue
+                rows_by_line[line] = {
+                    "_line": line,
+                    "instruction": item["instruction"] or "",
+                    "input": item["input"] or "",
+                    "output": item["output"] or "",
+                }
+                if len(rows_by_line) >= candidate_pool:
+                    break
+
+            if len(rows_by_line) >= candidate_pool:
+                break
+
+    return list(rows_by_line.values())
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Search noname skill dataset.jsonl with query rewriting and return best matches."
+        description="Search noname skill/card sqlite dataset with query rewriting and return best matches."
     )
     parser.add_argument("--query", required=True, help="Search query, e.g. '锁定技 体力变化 蓄力'")
-    parser.add_argument("--dataset", default=str(default_dataset_path()), help="Path to dataset.jsonl")
+    parser.add_argument(
+        "--dataset-kind",
+        choices=["skill", "card"],
+        default="skill",
+        help="Preset dataset profile. skill=skills dataset, card=card code/effect dataset.",
+    )
+    parser.add_argument("--sqlite-path", default="", help="Path to dataset.sqlite3 (optional override)")
+    parser.add_argument(
+        "--candidate-pool",
+        type=int,
+        default=1200,
+        help="Max candidate rows loaded from sqlite before rerank.",
+    )
     parser.add_argument("--top-k", type=int, default=5, help="Number of results to return")
     parser.add_argument("--max-routes", type=int, default=10, help="Max rewritten query routes")
+    parser.add_argument(
+        "--min-overlap",
+        type=int,
+        default=0,
+        help="Minimum overlapped query tokens per row. 0 means auto threshold.",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=0.0,
+        help="Minimum final score required to keep a row.",
+    )
     parser.add_argument(
         "--rewrite-mode",
         choices=["auto", "rule", "llm"],
@@ -365,11 +620,14 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Print results as JSON")
     args = parser.parse_args()
 
-    dataset_path = Path(args.dataset).resolve()
-    if not dataset_path.exists():
-        raise SystemExit(f"Dataset file not found: {dataset_path}")
-
-    rows = load_jsonl(dataset_path)
+    if args.sqlite_path:
+        sqlite_path = Path(args.sqlite_path).resolve()
+    else:
+        sqlite_path = (
+            default_card_sqlite_path().resolve()
+            if args.dataset_kind == "card"
+            else default_sqlite_path().resolve()
+        )
     if args.multi_route:
         routes, route_mode_used = build_routes(
             query=args.query,
@@ -383,31 +641,83 @@ def main() -> int:
     else:
         routes = [args.query]
         route_mode_used = "disabled"
-    route_features = [(route, normalize(route), tokenize(route)) for route in routes]
 
-    scored: list[tuple[float, dict[str, Any], str]] = []
-    for row in rows:
+    search_engine = "sqlite"
+    if not sqlite_path.exists():
+        raise SystemExit(f"SQLite index file not found: {sqlite_path}")
+    rows = load_candidates_from_sqlite(
+        sqlite_path=sqlite_path,
+        routes=routes,
+        candidate_pool=max(200, args.candidate_pool),
+    )
+    if not rows:
+        print("No matched rows.")
+        return 0
+
+    row_features, token_idf = build_feature_index(rows)
+    effective_min_overlap = args.min_overlap
+    if effective_min_overlap <= 0 and args.dataset_kind == "card":
+        effective_min_overlap = 1
+
+    route_features = []
+    for route in routes:
+        route_norm = normalize(route)
+        route_base_tokens = filter_query_tokens(tokenize(route, expand_hints=False))
+        route_tokens = filter_query_tokens(tokenize(route, expand_hints=True))
+        route_min_overlap = min_required_overlap(route_base_tokens, effective_min_overlap)
+        required_trigger_tokens = collect_required_tokens(route_norm, TRIGGER_HINTS)
+        required_effect_tokens = collect_required_tokens(route_norm, EFFECT_HINTS)
+        route_features.append(
+            (
+                route,
+                route_norm,
+                route_tokens,
+                route_min_overlap,
+                required_trigger_tokens,
+                required_effect_tokens,
+            )
+        )
+
+    scored: list[tuple[float, RowFeatures, str]] = []
+    for rowf in row_features:
         best_score = 0.0
         best_route = ""
-        for route, route_norm, route_tokens in route_features:
-            score = score_row(route_norm, route_tokens, row)
+        for (
+            route,
+            route_norm,
+            route_tokens,
+            route_min_overlap,
+            required_trigger_tokens,
+            required_effect_tokens,
+        ) in route_features:
+            score = score_row(
+                query_norm=route_norm,
+                query_tokens=route_tokens,
+                rowf=rowf,
+                token_idf=token_idf,
+                min_overlap=route_min_overlap,
+                required_trigger_tokens=required_trigger_tokens,
+                required_effect_tokens=required_effect_tokens,
+            )
             if score > best_score:
                 best_score = score
                 best_route = route
-        if best_score > 0:
-            scored.append((best_score, row, best_route))
+        if best_score >= args.min_score and best_score > 0:
+            scored.append((best_score, rowf, best_route))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[: max(args.top_k, 1)]
 
     if args.json:
         payload = []
-        for score, row, matched_route in top:
+        for score, rowf, matched_route in top:
+            row = rowf.row
             output = str(row.get("output", ""))
             payload.append(
                 {
                     "score": round(score, 4),
                     "line": row.get("_line"),
+                    "search_engine": search_engine,
                     "route_mode_used": route_mode_used,
                     "matched_route": matched_route,
                     "instruction": row.get("instruction", ""),
@@ -422,8 +732,9 @@ def main() -> int:
         print("No matched rows.")
         return 0
 
-    print(f"Dataset: {dataset_path}")
-    print(f"Total rows: {len(rows)}")
+    print(f"Search engine: {search_engine}")
+    print(f"SQLite index: {sqlite_path}")
+    print(f"Candidate rows: {len(rows)}")
     print(f"Query: {args.query}")
     print(f"Route mode: {route_mode_used}")
     print(f"Routes: {len(routes)}")
@@ -436,7 +747,8 @@ def main() -> int:
             print(f"  {i}. {route}")
         print("")
 
-    for idx, (score, row, matched_route) in enumerate(top, start=1):
+    for idx, (score, rowf, matched_route) in enumerate(top, start=1):
+        row = rowf.row
         instruction = str(row.get("instruction", ""))
         model_input = str(row.get("input", ""))
         output = str(row.get("output", ""))

@@ -35,6 +35,33 @@ NonameSkill/
 
 ## 安装
 
+### 一键安装（推荐）
+
+使用 [skills CLI](https://github.com/vercel-labs/skills) 安装前，请确保已安装 Node.js 22.20 或更高版本。技能中的检索脚本仍需 Python 3.10+。
+
+在当前项目安装（交互式选择目标 Agent）：
+
+```bash
+npx skills add TianyaSKY/NonameSkill
+```
+
+全局安装到 Codex（跳过交互确认）：
+
+```bash
+npx skills add TianyaSKY/NonameSkill -g -a codex -y
+```
+
+查看仓库中可用的 Skill 和本地已安装的 Skill：
+
+```bash
+npx skills add TianyaSKY/NonameSkill --list
+npx skills list
+```
+
+该仓库中的 Skill 名称为 `noname-extension-dev`。默认安装范围为当前项目，添加 `-g` 则安装到用户级目录。
+
+### 手动安装
+
 将本目录放入 Codex skills 目录（示例）：
 
 ```powershell
